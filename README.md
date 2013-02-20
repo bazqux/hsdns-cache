@@ -10,6 +10,8 @@ in round-robin fashion.
 Limits number of parallel requests (so DNS resolving continues to work
 even under heavy load).
 
+Errors are cached too (for one minute).
+
 Handles CNAMEs ([hsdns](http://hackage.haskell.org/package/hsdns) returns error
 for them).
      
