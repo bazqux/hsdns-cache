@@ -35,7 +35,7 @@ module ADNS.Cache
     , showHostAddress
     ) where
 
-import ADNS
+import ADNS hiding (HostName, HostAddress)
 import ADNS.Base
 import ADNS.Endian
 import Data.List
@@ -47,6 +47,8 @@ import Data.Bits
 import Control.Concurrent
 import qualified Control.Concurrent.MSem as MSem
 import Data.Time.Clock.POSIX
+import Network.Socket (HostName, HostAddress, inet_ntoa)
+--  ^ just to make docs link to Network.Socket instead of ADNS
 
 -- | Asynchronous DNS cache.
 data DnsCache
