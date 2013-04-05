@@ -29,7 +29,7 @@ module ADNS.Cache
     , stopDnsCache
 
       -- * DNS lookup
-    , resolveA
+    , resolveA, resolveCachedA
 
       -- * Utils
     , showHostAddress
@@ -91,8 +91,23 @@ stopDnsCache d =
 
 -- | Resolve A DNS record.
 resolveA :: DnsCache -> HostName -> IO (Either String HostAddress)
-resolveA d@(DnsCache {..}) domain
-    | isIPAddr domain = return $ Right $ ipToWord32 domain
+resolveA d domain = do
+    r <- tryResolveA' d domain
+    either id return r
+
+-- | Resolve cached A DNS record.
+-- Returns Nothing if host name is not yet cached.
+resolveCachedA :: DnsCache -> HostName -> IO (Maybe (Either String HostAddress))
+resolveCachedA d domain = do
+    r <- tryResolveA' d domain
+    return $ either (const Nothing) Just r
+
+type ResultA = Either String HostAddress
+
+-- | Returns action to resolve A or cached resolved action
+tryResolveA' :: DnsCache -> HostName -> IO (Either (IO ResultA) ResultA)
+tryResolveA' d@(DnsCache {..}) domain
+    | isIPAddr domain = return $ Right $ Right $ ipToWord32 domain
     | otherwise = do
     t <- getPOSIXTime
     mbr <- modifyMVar cache $ \ c ->
@@ -102,13 +117,13 @@ resolveA d@(DnsCache {..}) domain
                                insRot False c expT a
              _ -> return (c, Nothing)
     case mbr of
-        Just r -> return r
-        _ -> do
+        Just r -> return $ Right r
+        _ -> return $ Left $ do
             ra <- MSem.with sem $ resolveA' d [] domain
             modifyMVar cache $ \ m ->
                 case ra of
-                    Left e -> insRot True m (t+60) $ Left $ T.pack e
-                    Right (max (t+60) -> et, rras) ->
+                    Left e -> insRot True m (t+600) $ Left $ T.pack e
+                    Right (max (t+600) -> et, rras) ->
                         insRot True m et $ Right $ listQ [a | RRAddr a <- rras]
     where key = T.pack domain
           err False m _ e = return (m, Left $ T.unpack e)
@@ -185,6 +200,7 @@ _test = withDnsCache $ \ c -> do
     rn 10 "wordpress.com"
     rn 10 "feedburner.com"
     rn 10 "feeds.feedburner.com"
+    print =<< resolveCachedA c "feeds.feedburner.com"
 --     replicateM_ 1000 $ do
 --         resolveA c "www.blogger.com"
 --         resolveA c "google.com"
