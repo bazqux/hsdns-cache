@@ -57,6 +57,7 @@ data DnsCache
       , sem      :: MSem.MSem Int
       , cache    :: MVar (HM.HashMap T.Text (POSIXTime,
                                              Either T.Text (Queue HostAddress)))
+      , active :: MVar (HM.HashMap T.Text [MVar (Either String (POSIXTime, [RRAddr]))])
       }
 
 data Queue a = Queue ![a] ![a]
@@ -81,8 +82,9 @@ withDnsCache act =
         --        ^ there was sigsegv in adns__lprintf when exiting using Ctrl+C
         --          so the warnings printing is suppressed
         c <- newMVar HM.empty
+        a <- newMVar HM.empty
         s <- MSem.new maxQueries
-        act (DnsCache r s c)
+        act (DnsCache r s c a)
 
 -- | Wait till all running resolvers are finished and block further resolvers.
 stopDnsCache :: DnsCache -> IO ()
@@ -107,6 +109,10 @@ type ResultA = Either String HostAddress
 -- | Returns action to resolve A or cached resolved action
 tryResolveA' :: DnsCache -> HostName -> IO (Either (IO ResultA) ResultA)
 tryResolveA' d@(DnsCache {..}) domain
+    | any (`elem` ":/?") domain = return $ Right $ Left "Invalid domain name"
+    | length domain > 253 = return $ Right $ Left "Domain name too long"
+    | any (\ t -> T.length t > 63) (T.split (== '.') $ T.pack domain) =
+        return $ Right $ Left "Domain name or component too long"
     | isIPAddr domain = return $ Right $ Right $ ipToWord32 domain
     | otherwise = do
     t <- getPOSIXTime
@@ -119,7 +125,23 @@ tryResolveA' d@(DnsCache {..}) domain
     case mbr of
         Just r -> return $ Right r
         _ -> return $ Left $ do
-            ra <- MSem.with sem $ resolveA' d [] domain
+            res <- modifyMVar active $ \ a ->
+                case HM.lookup key a of
+                    Just ws -> do
+                        w <- newEmptyMVar
+                        return (HM.insert key (w:ws) a, takeMVar w)
+                    Nothing ->
+                        return (HM.insert key [] a, do
+--                                    print ("resolve", domain)
+                                    r <- MSem.with sem $ resolveA' d [] domain
+                                    modifyMVar_ active $ \ a ->
+                                        case HM.lookup key a of
+                                            Just ws -> do
+                                                mapM_ (\ w -> putMVar w r) ws
+                                                return $ HM.delete key a
+                                            Nothing -> return a -- ?
+                                    return r)
+            ra <- res
             modifyMVar cache $ \ m ->
                 case ra of
                     Left e -> insRot True m (t+600) $ Left $ T.pack e
@@ -204,3 +226,11 @@ _test = withDnsCache $ \ c -> do
 --     replicateM_ 1000 $ do
 --         resolveA c "www.blogger.com"
 --         resolveA c "google.com"
+    s <- MSem.new 0
+    replicateM_ 1000 $ do
+        forkIO $ void $ resolveA c "blog.bazqux.com" >> MSem.signal s
+--        forkIO $ void $ resolveA c "google.com"
+    replicateM_ 1000 $ MSem.wait s
+    print =<< resolveA c "blog.bazqux.com"
+    print =<< resolveA c
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b"
