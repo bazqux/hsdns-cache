@@ -7,7 +7,7 @@
    * Resolves several IP addresses for one host (if available)
      in round-robin fashion.
 
-   * Limits number of parallel requests (so DNS resolving continues to work
+   * Throttles number of parallel requests (so DNS resolving continues to work
      even under heavy load).
 
    * Errors are cached too (for one minute).
@@ -19,16 +19,21 @@
   on the command-line.
 
   This cache is tested in a long running web-crawler
-  (used in <http://bazqux.com>) so it should be safe to use it in real world
+  (used in <https://bazqux.com>) so it should be safe to use it in real world
   applications.
 -}
 module ADNS.Cache
-    ( -- * DNS cache
+    ( -- * Cache
       DnsCache
     , withDnsCache
+    , withDnsCacheSettings
     , stopDnsCache
 
-      -- * DNS lookup
+      -- * Settings
+    , DnsCacheSettings(..)
+    , defaultDnsCacheSettings
+
+      -- * Lookup
     , resolveA, resolveCachedA
 
       -- * Utils
@@ -58,7 +63,25 @@ data DnsCache
       , cache    :: MVar (HM.HashMap T.Text (POSIXTime,
                                              Either T.Text (Queue HostAddress)))
       , active :: MVar (HM.HashMap T.Text [MVar (Either String (POSIXTime, [RRAddr]))])
+      , settings :: DnsCacheSettings
+      , delayMVar :: MVar ()
       }
+
+-- | DNS cache settings.
+data DnsCacheSettings
+    = DnsCacheSettings
+      { dcsMaxParallelRequests :: Int
+        -- ^ Throttling of parallel requests. Default: 30
+      , dcsRequestDelay :: Maybe Int
+        -- ^ Experimental!
+        -- Delay in microseconds between subsequent requests to smooth load.
+        -- Delay only inserted between real requests to DNS server.
+        -- Cached results are returned immediately.
+        -- Default: `Nothing`
+      }
+    deriving (Eq, Show, Read)
+
+defaultDnsCacheSettings = DnsCacheSettings 30 Nothing
 
 data Queue a = Queue ![a] ![a]
     deriving Show
@@ -71,25 +94,26 @@ rotQ (Queue [] []) = Nothing
 rotQ (Queue (x:xs) ys) = Just (x, Queue xs (x:ys))
 rotQ (Queue [] ys) = rotQ (Queue (reverse ys) [])
 
--- not more than 30 simultaneous resolveA calls
-maxQueries :: Int
-maxQueries = 30
-
 -- | Create cache and run action passed.
 withDnsCache :: (DnsCache -> IO a) -> IO a
-withDnsCache act =
+withDnsCache = withDnsCacheSettings defaultDnsCacheSettings
+
+-- | Create cache with specified settings and run action passed.
+withDnsCacheSettings :: DnsCacheSettings -> (DnsCache -> IO a) -> IO a
+withDnsCacheSettings settings act =
     initResolver [NoErrPrint, NoServerWarn, NoSigPipe] $ \ r -> do
         --        ^ there was sigsegv in adns__lprintf when exiting using Ctrl+C
         --          so the warnings printing is suppressed
         c <- newMVar HM.empty
         a <- newMVar HM.empty
-        s <- MSem.new maxQueries
-        act (DnsCache r s c a)
+        s <- MSem.new $ dcsMaxParallelRequests settings
+        d <- newMVar ()
+        act (DnsCache r s c a settings d)
 
 -- | Wait till all running resolvers are finished and block further resolvers.
 stopDnsCache :: DnsCache -> IO ()
 stopDnsCache d =
-    replicateM_ maxQueries $ MSem.wait (sem d)
+    replicateM_ (dcsMaxParallelRequests $ settings d) $ MSem.wait (sem d)
 
 -- | Resolve A DNS record.
 resolveA :: DnsCache -> HostName -> IO (Either String HostAddress)
@@ -133,7 +157,9 @@ tryResolveA' d@(DnsCache {..}) domain
                     Nothing ->
                         return (HM.insert key [] a, do
 --                                    print ("resolve", domain)
-                                    r <- MSem.with sem $ resolveA' d [] domain
+                                    r <- MSem.with sem $ do
+                                        delay
+                                        resolveA' d [] domain
                                     modifyMVar_ active $ \ a ->
                                         case HM.lookup key a of
                                             Just ws -> do
@@ -157,6 +183,10 @@ tryResolveA' d@(DnsCache {..}) domain
                           Right a)
               | otherwise =
                   err f m t "No RRAddr???"
+          delay
+              | Just dl <- dcsRequestDelay settings =
+                  withMVar delayMVar $ const $ threadDelay dl
+              | otherwise = return ()
 
 resolveA' :: DnsCache -> [HostName] -> HostName
           -> IO (Either String (POSIXTime, [RRAddr]))
@@ -209,7 +239,7 @@ showHostAddress = show . RRAddr
 
 
 _test :: IO ()
-_test = withDnsCache $ \ c -> do
+_test = withDnsCacheSettings (DnsCacheSettings 10 (Just 1000000)) $ \ c -> do
     let r hn = do
           h <- resolveA c hn
           putStrLn $ hn ++ ": " ++ either id showHostAddress h
